@@ -23,10 +23,14 @@ scripts/logs/
 
 # Chroma / embedding / model caches
 chroma_db/
+backend/chroma_db/
+backend/chroma_db/*.sqlite3
 .chroma/
 transformers_cache/
 onnx_cache/
 hf_cache/
+# Project DB files
+db/*.sqlite3
 
 # Byte-compiled / packaging
 build/
