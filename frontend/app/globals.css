@@ -1,0 +1,50 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+  --background: 222 39% 7%;
+  --surface: 221 32% 10%;
+  --border: 215 30% 17%;
+  --primary: 244 75% 57%;
+  --muted: 215 16% 65%;
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+  --background: 210 40% 99%;
+  --surface: 210 40% 96%;
+  --border: 214 24% 88%;
+  --primary: 244 75% 57%;
+  --muted: 215 16% 45%;
+}
+
+body {
+  @apply bg-background text-white;
+}
+
+.prose-markdown pre {
+  @apply rounded-lg bg-[#0f1621] p-3 overflow-x-auto;
+}
+
+.prose-markdown code {
+  @apply rounded bg-white/10 px-1 py-0.5 text-xs;
+}
+
+.prose-markdown pre code {
+  @apply bg-transparent p-0 text-sm;
+}
+
+.prose-markdown a {
+  @apply text-primary underline;
+}
+
+.scrollbar-hide::-webkit-scrollbar {
+  display: none;
+}
+
+.scrollbar-hide {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
