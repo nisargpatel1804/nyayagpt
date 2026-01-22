@@ -25,15 +25,19 @@ export default async function DashboardLayout({
   const apiBase = apiUrl ? apiUrl.replace(/\/$/, "") + "/v1" : null;
   let chats: any[] = [];
   if (apiBase) {
-    const res = await fetch(`${apiBase}/chats`, {
-      headers: {
-        "Authorization": `Bearer ${session.access_token}`,
-      },
-      cache: "no-store",
-    });
-    if (res.ok) {
-      const payload = await res.json();
-      chats = payload?.chats || [];
+    try {
+      const res = await fetch(`${apiBase}/chats`, {
+        headers: {
+          "Authorization": `Bearer ${session.access_token}`,
+        },
+        cache: "no-store",
+      });
+      if (res.ok) {
+        const payload = await res.json();
+        chats = payload?.chats || [];
+      }
+    } catch (error) {
+      console.warn("Dashboard chats fetch failed", error);
     }
   }
 

@@ -4,6 +4,8 @@ python-dotenv==1.0.1
 python-jose==3.3.0
 supabase==2.5.1
 langchain-community==0.2.11
+langchain-chroma==0.1.4
+langchain-huggingface==0.0.3
 langchain-text-splitters==0.2.4
 chromadb==0.5.23
 sentence-transformers==3.0.1

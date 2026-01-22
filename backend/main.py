@@ -14,6 +14,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, constr
 from jose import jwt, JWTError
 from supabase import create_client, Client
+from postgrest.exceptions import APIError
 from dotenv import load_dotenv
 
 os.environ["CUDA_VISIBLE_DEVICES"] = ""
@@ -31,9 +32,9 @@ except Exception:
 
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="langchain")
 
-from langchain_community.vectorstores import Chroma
-from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.chat_models import ChatOllama
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_chroma import Chroma
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 
 load_dotenv()
@@ -73,6 +74,18 @@ if LOG_FILE:
 
 logging.basicConfig(level=LOG_LEVEL, handlers=handlers)
 logger = logging.getLogger("nyayagpt")
+
+
+def _is_missing_column_error(exc: Exception, column: str | None = None) -> bool:
+    if not isinstance(exc, APIError):
+        return False
+    payload = exc.args[0] if exc.args else {}
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("code") != "42703":
+        return False
+    message = payload.get("message", "") or ""
+    return (column in message) if column else True
 
 def _env_int(name: str, default: int, min_value: int | None = None, max_value: int | None = None) -> int:
     raw = os.getenv(name, str(default))
@@ -426,7 +439,7 @@ async def _get_recent_messages(chat_id: str, limit: int) -> list[Any]:
         lambda: supabase.table("messages")
         .select("role, content, created_at")
         .eq("chat_id", chat_id)
-        .order("created_at", {"ascending": False})
+        .order("created_at", desc=True)
         .limit(limit)
         .execute()
     )
@@ -484,13 +497,29 @@ async def list_chats(
         supabase.table("chats")
         .select("id, title, pinned, created_at")
         .eq("user_id", token_data.sub)
-        .order("pinned", {"ascending": False})
-        .order("created_at", {"ascending": False})
+        .order("pinned", desc=True)
+        .order("created_at", desc=True)
     )
     if before:
         query = query.lt("created_at", before)
-    res = await execute_supabase(lambda: query.limit(limit).execute())
-    chats = _extract_supabase_data(res) or []
+    try:
+        res = await execute_supabase(lambda: query.limit(limit).execute())
+        chats = _extract_supabase_data(res) or []
+    except APIError as exc:
+        if not _is_missing_column_error(exc, "chats.pinned"):
+            raise
+        fallback_query = (
+            supabase.table("chats")
+            .select("id, title, created_at")
+            .eq("user_id", token_data.sub)
+            .order("created_at", desc=True)
+        )
+        if before:
+            fallback_query = fallback_query.lt("created_at", before)
+        res = await execute_supabase(lambda: fallback_query.limit(limit).execute())
+        chats = _extract_supabase_data(res) or []
+        for chat in chats:
+            chat["pinned"] = False
     if not before and limit == DEFAULT_PAGE_LIMIT:
         _set_cached_chats(token_data.sub, chats)
     return {"chats": chats}
@@ -499,14 +528,28 @@ async def list_chats(
 @app.post("/v1/chats")
 async def create_chat(payload: CreateChatRequest, token_data: TokenData = Depends(verify_token)):
     title = sanitize_text(payload.title or "New chat", 80) or "New chat"
-    res = await execute_supabase(
-        lambda: supabase.table("chats")
-        .insert({"user_id": token_data.sub, "title": title})
-        .select("id, title, pinned")
-        .single()
-        .execute()
-    )
-    data = _extract_supabase_data(res)
+    try:
+        res = await execute_supabase(
+            lambda: supabase.table("chats")
+            .insert({"user_id": token_data.sub, "title": title})
+            .select("id, title, pinned")
+            .single()
+            .execute()
+        )
+        data = _extract_supabase_data(res)
+    except APIError as exc:
+        if not _is_missing_column_error(exc, "chats.pinned"):
+            raise
+        res = await execute_supabase(
+            lambda: supabase.table("chats")
+            .insert({"user_id": token_data.sub, "title": title})
+            .select("id, title")
+            .single()
+            .execute()
+        )
+        data = _extract_supabase_data(res)
+        if data is not None:
+            data["pinned"] = False
     if not data:
         return error_response("CHAT_CREATE_FAILED", "Unable to create chat.", 500)
     _invalidate_chats_cache(token_data.sub)
@@ -530,7 +573,7 @@ async def get_chat_messages(
     )
     if before:
         query = query.lt("created_at", before)
-    res = await execute_supabase(lambda: query.order("created_at", {"ascending": True}).limit(limit).execute())
+    res = await execute_supabase(lambda: query.order("created_at", desc=False).limit(limit).execute())
     return {"messages": _extract_supabase_data(res) or []}
 
 
@@ -616,6 +659,17 @@ async def pin_chat(chat_id: UUID, payload: dict, token_data: TokenData = Depends
     pinned = bool(payload.get("pinned"))
     await _verify_chat_ownership(str(chat_id), token_data.sub)
 
-    await execute_supabase(lambda: supabase.table("chats").update({"pinned": pinned}).eq("id", str(chat_id)).execute())
+    try:
+        await execute_supabase(
+            lambda: supabase.table("chats").update({"pinned": pinned}).eq("id", str(chat_id)).execute()
+        )
+    except APIError as exc:
+        if _is_missing_column_error(exc, "chats.pinned"):
+            return error_response(
+                "PIN_NOT_SUPPORTED",
+                "Pinned chats are not enabled. Apply the latest database schema to add chats.pinned.",
+                400,
+            )
+        raise
     _invalidate_chats_cache(token_data.sub)
     return {"status": "ok", "id": str(chat_id), "pinned": pinned}
