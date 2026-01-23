@@ -20,7 +20,10 @@ export default class ErrorBoundary extends React.Component<ErrorBoundaryProps, E
   }
 
   componentDidCatch(error: Error, errorInfo: React.ErrorInfo) {
-    console.error("ErrorBoundary caught an error:", error, errorInfo);
+    console.error("NyayaGPT UI error:", error?.message || error);
+    if (process.env.NODE_ENV !== "production") {
+      console.error("ErrorBoundary details:", errorInfo);
+    }
   }
 
   handleRetry = () => {

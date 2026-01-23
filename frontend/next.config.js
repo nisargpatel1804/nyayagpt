@@ -1,6 +1,7 @@
 const apiUrl = process.env.NEXT_PUBLIC_API_URL || "";
-// Allow connections to the backend API and the frontend itself
-const connectSrc = ["'self'", apiUrl].filter(Boolean).join(" ");
+const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL || "";
+// Allow connections to the backend API, Supabase and the frontend itself
+const connectSrc = ["'self'", apiUrl, supabaseUrl].filter(Boolean).join(" ");
 
 const csp = [
   "default-src 'self'",

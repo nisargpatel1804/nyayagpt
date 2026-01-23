@@ -56,7 +56,7 @@ body {
 }
 
 .prose-markdown code {
-  @apply rounded bg-white/10 px-1.5 py-0.5 text-xs font-mono text-primary-foreground;
+  @apply rounded bg-white/10 px-1.5 py-0.5 text-xs font-mono text-white;
 }
 
 .prose-markdown pre code {

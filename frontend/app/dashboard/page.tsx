@@ -16,6 +16,7 @@ type Message = {
   content: string; 
   created_at?: string; 
   isTimeline?: boolean; 
+  isError?: boolean;
 };
 
 export default function DashboardPage() {
@@ -27,6 +28,7 @@ export default function DashboardPage() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
+  const [loadingHistory, setLoadingHistory] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
   
   // MODES: Standard, Timeline, Devil's Advocate
@@ -35,7 +37,42 @@ export default function DashboardPage() {
 
   const bottomRef = useRef<HTMLDivElement>(null);
   const streamingContentRef = useRef("");
-  const apiUrl = process.env.NEXT_PUBLIC_API_URL?.replace(/\/$/, "") + "/v1";
+  const messagesRef = useRef<Message[]>([]);
+  const loadingRef = useRef(false);
+  const abortRef = useRef<AbortController | null>(null);
+  const cancelRequestedRef = useRef(false);
+  const autoScrollRef = useRef(true);
+  const apiBase = process.env.NEXT_PUBLIC_API_URL?.replace(/\/$/, "");
+  const apiUrl = apiBase ? `${apiBase}/v1` : null;
+  const scrollContainerRef = useRef<HTMLDivElement>(null);
+
+  const appendErrorMessage = (content: string) => {
+    setMessages((p) => [
+      ...p,
+      {
+        id: `err_${Date.now()}`,
+        role: "assistant",
+        content,
+        isError: true,
+        isTimeline: false
+      }
+    ]);
+  };
+
+  const setToastAndLog = (message: string, error?: unknown) => {
+    setToast(message);
+    if (error) {
+      console.error("NyayaGPT error:", error);
+    }
+  };
+
+  useEffect(() => {
+    messagesRef.current = messages;
+  }, [messages]);
+
+  useEffect(() => {
+    loadingRef.current = loading;
+  }, [loading]);
 
   // --- Load Chat History ---
   useEffect(() => {
@@ -45,6 +82,7 @@ export default function DashboardPage() {
     }
     
     const fetchMsgs = async () => {
+      setLoadingHistory(true);
       const { data } = await supabase.auth.getSession();
       if (!data.session || !apiUrl) return;
       
@@ -60,22 +98,72 @@ export default function DashboardPage() {
             ...m,
             isTimeline: m.content.trim().startsWith("[") && m.content.includes('"Date"')
           }));
-          setMessages(msgs);
+          const hasPending = messagesRef.current.some(m => !m.created_at || m.id.endsWith("_ai"));
+          if (hasPending && msgs.length === 0) return;
+          if (hasPending && loadingRef.current) {
+            setMessages(prev => [...msgs, ...prev.filter(m => !m.created_at || m.id.endsWith("_ai"))]);
+          } else {
+            setMessages(msgs);
+          }
           setTimeout(() => bottomRef.current?.scrollIntoView(), 100);
         } else if (res.status === 404) {
           router.replace("/dashboard");
+        } else if (res.status === 401) {
+          router.replace("/login");
+        } else {
+          const errPayload = await res.json().catch(() => null);
+          setToastAndLog(errPayload?.error || "Failed to load messages.");
         }
       } catch (e) { 
-        console.error("Failed to fetch messages:", e); 
+        setToastAndLog("Failed to load messages.", e);
+      } finally {
+        setLoadingHistory(false);
       }
     };
     
     fetchMsgs();
   }, [chatIdParam, apiUrl, router, supabase.auth]);
 
+  useEffect(() => {
+    const onScroll = () => {
+      const container = scrollContainerRef.current;
+      if (!container) return;
+      const atBottom = container.scrollHeight - container.scrollTop - container.clientHeight < 80;
+      autoScrollRef.current = atBottom;
+    };
+    const container = scrollContainerRef.current;
+    if (!container) return;
+    container.addEventListener("scroll", onScroll, { passive: true });
+    return () => container.removeEventListener("scroll", onScroll);
+  }, []);
+
+  useEffect(() => {
+    const onGlobalError = (event: Event) => {
+      const detail = (event as CustomEvent<{ message: string }>).detail;
+      if (detail?.message) {
+        setToastAndLog(`Error: ${detail.message}`);
+      }
+    };
+    window.addEventListener("nyayagpt:global-error", onGlobalError as EventListener);
+    return () => window.removeEventListener("nyayagpt:global-error", onGlobalError as EventListener);
+  }, []);
+
   // --- Handle Send Logic ---
   const handleSend = async () => {
-    if (!input.trim() || loading || !apiUrl) return;
+    if (!input.trim() || loading) return;
+    if (!apiUrl) {
+      setToastAndLog("Error: API URL is not configured.");
+      return;
+    }
+
+    const CHAT_CREATE_TIMEOUT_MS = 15000;
+    const STREAM_IDLE_TIMEOUT_MS = 120000;
+    let timeoutId: ReturnType<typeof setTimeout> | null = null;
+    let controller: AbortController | null = null;
+    const resetTimeout = () => {
+      if (timeoutId) clearTimeout(timeoutId);
+      timeoutId = setTimeout(() => controller?.abort(), STREAM_IDLE_TIMEOUT_MS);
+    };
     
     const userContent = input.trim();
     const currentMode = mode;
@@ -103,17 +191,27 @@ export default function DashboardPage() {
       const { data } = await supabase.auth.getSession();
       if (!data.session) throw new Error("Unauthorized");
       const token = data.session.access_token;
+      controller = new AbortController();
+      abortRef.current = controller;
+      cancelRequestedRef.current = false;
 
       // 2. Create Chat if Needed (Ghost Chat Prevention)
       let currentChatId = chatIdParam;
       if (!currentChatId) {
+        const createController = new AbortController();
+        const createTimeout = setTimeout(() => createController.abort(), CHAT_CREATE_TIMEOUT_MS);
         const cRes = await fetch(`${apiUrl}/chats`, {
           method: "POST", 
           headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
           body: JSON.stringify({ title: userContent.slice(0, 30) }),
+          signal: createController.signal
         });
+        clearTimeout(createTimeout);
         
-        if (!cRes.ok) throw new Error("Failed to create chat");
+        if (!cRes.ok) {
+          const errPayload = await cRes.json().catch(() => null);
+          throw new Error(errPayload?.error || `Failed to create chat (${cRes.status})`);
+        }
         
         const cData = await cRes.json();
         currentChatId = cData.chat.id;
@@ -125,6 +223,7 @@ export default function DashboardPage() {
       }
 
       // 3. Start Streaming Request
+      resetTimeout();
       const res = await fetch(`${apiUrl}/chat`, {
         method: "POST", 
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
@@ -134,18 +233,25 @@ export default function DashboardPage() {
           mode: currentMode,
           jurisdiction: currentJurisdiction
         }),
+        signal: controller.signal
       });
 
-      if (!res.ok || !res.body) throw new Error("Stream failed");
+      if (!res.ok || !res.body) {
+        const errPayload = await res.json().catch(() => null);
+        throw new Error(errPayload?.error || `Stream failed (${res.status})`);
+      }
       
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
       let buffer = "";
+      let receivedAnyToken = false;
 
       // 4. Stream Loop
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
+
+        resetTimeout();
         
         buffer += decoder.decode(value, { stream: true });
         const lines = buffer.split("\n");
@@ -158,19 +264,25 @@ export default function DashboardPage() {
             
             if (json.type === "token") {
               streamingContentRef.current += json.content;
+              receivedAnyToken = true;
               
               setMessages(p => p.map(m => 
                 m.id === aiMsgId ? { ...m, content: streamingContentRef.current } : m
               ));
               
               // Only auto-scroll if user hasn't scrolled up significantly
-              bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+              if (autoScrollRef.current) {
+                bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+              }
             } 
             else if (json.type === "end" && json.warning) {
               setToast("⚠️ Response generated, but history save failed.");
             }
             else if (json.type === "error") {
               setToast(`Error: ${json.content}`);
+              setMessages(p => p.map(m =>
+                m.id === aiMsgId ? { ...m, content: json.content, isError: true, isTimeline: false } : m
+              ));
             }
           } catch (e) {
             // Ignore parse errors for partial chunks
@@ -178,14 +290,40 @@ export default function DashboardPage() {
         }
       }
     } catch (e: any) {
-      setToast(`Error: ${e.message}`);
-      // If failed before any token received, remove the placeholder
-      if (!streamingContentRef.current) {
-        setMessages(p => p.filter(m => m.id !== aiMsgId));
-        setInput(userContent);
+      const isAbort = e?.name === "AbortError";
+      if (isAbort && cancelRequestedRef.current) {
+        setToast("Cancelled.");
+        if (!streamingContentRef.current) {
+          setMessages(p => p.map(m =>
+            m.id === aiMsgId
+              ? { ...m, content: "Cancelled.", isError: false, isTimeline: false }
+              : m
+          ));
+        }
+      } else {
+        const msg = isAbort ? "Error: Request timed out. Please try again." : `Error: ${e.message}`;
+        setToastAndLog(msg, e);
+        // If failed before any token received, replace placeholder with error
+        if (!streamingContentRef.current) {
+          setMessages(p => p.map(m =>
+            m.id === aiMsgId
+              ? { ...m, content: msg.replace(/^Error:\s*/i, ""), isError: true, isTimeline: false }
+              : m
+          ));
+          setInput(userContent);
+        }
       }
     } finally { 
+      if (timeoutId) clearTimeout(timeoutId);
+      abortRef.current = null;
       setLoading(false); 
+    }
+  };
+
+  const handleCancel = () => {
+    if (abortRef.current) {
+      cancelRequestedRef.current = true;
+      abortRef.current.abort();
     }
   };
 
@@ -222,7 +360,7 @@ export default function DashboardPage() {
         )}
         
         {/* Chat Area */}
-        <div className="flex-1 overflow-y-auto p-4 scrollbar-hide md:p-6">
+        <div ref={scrollContainerRef} className="flex-1 overflow-y-auto p-4 scrollbar-hide md:p-6">
           {!chatIdParam && messages.length === 0 ? (
             <div className="mt-10 md:mt-20">
               <EmptyState />
@@ -239,6 +377,7 @@ export default function DashboardPage() {
                       role={msg.role} 
                       content={msg.content} 
                       createdAt={msg.created_at} 
+                      isError={msg.isError}
                       onCopy={() => navigator.clipboard.writeText(msg.content)}
                     />
                   )}
@@ -246,7 +385,7 @@ export default function DashboardPage() {
               ))}
               
               {/* Typing Indicator */}
-              {loading && !streamingContentRef.current && (
+              {loading && !streamingContentRef.current && !loadingHistory && (
                  <div className="flex items-center gap-2 rounded-2xl bg-white/5 px-4 py-3 text-sm text-muted w-fit animate-pulse">
                    <span>Thinking...</span>
                  </div>
@@ -291,7 +430,9 @@ export default function DashboardPage() {
               value={input} 
               onChange={setInput} 
               onSend={handleSend} 
+              onCancel={handleCancel}
               disabled={loading} 
+              disableInput={false}
               isLoading={loading} 
             />
             

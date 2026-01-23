@@ -1,4 +1,5 @@
 import os
+import logging
 os.environ["CUDA_VISIBLE_DEVICES"] = ""
 os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
 try:
@@ -18,6 +19,14 @@ from langchain_community.document_loaders import PyPDFLoader, TextLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
+
+# --- LOGGING ---
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=LOG_LEVEL,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+)
+logger = logging.getLogger("nyayagpt.ingest")
 
 DATA_DIR = Path("./data/indian_laws")
 PERSIST_DIR = Path("./chroma_db")
@@ -67,7 +76,7 @@ def load_documents(data_dir: Path):
             documents.extend(raw_docs)
             manifest.append(path)
         except Exception as e:
-            print(f"Error loading {path}: {e}")
+            logger.warning("Error loading %s: %s", path, str(e))
             
     return documents, manifest
 
@@ -93,7 +102,7 @@ def main():
     
     # Check if files changed to avoid re-ingesting unnecessarily
     if existing and existing.get("documents") == current_manifest.get("documents") and not INGEST_FORCE:
-        print("No changes. Skipping ingest.")
+        logger.info("No changes. Skipping ingest.")
         return
 
     splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
@@ -111,7 +120,7 @@ def main():
     try: vectordb.persist() 
     except: pass
 
-    print(f"Ingested {len(chunks)} chunks.")
+    logger.info("Ingested %s chunks.", len(chunks))
     
     manifest = {
         "ingested_at": datetime.now(timezone.utc).isoformat(),
@@ -123,4 +132,8 @@ def main():
     (PERSIST_DIR / "ingest_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        logger.error("Ingest failed: %s", str(e))
+        raise

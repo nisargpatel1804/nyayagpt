@@ -19,6 +19,16 @@ from jose import jwt, JWTError
 from supabase import create_client, Client
 from dotenv import load_dotenv
 
+# --- LOGGING ---
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=LOG_LEVEL,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+)
+logger = logging.getLogger("nyayagpt")
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("sentence_transformers").setLevel(logging.WARNING)
+
 # --- INITIAL SETUP & ENV ---
 os.environ["CUDA_VISIBLE_DEVICES"] = ""
 os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
@@ -39,33 +49,39 @@ from sentence_transformers import CrossEncoder
 
 load_dotenv()
 
-def _require_env(name: str, min_length: int = 1) -> str:
+def _get_env(name: str, min_length: int = 1, required: bool = False) -> str | None:
     value = os.getenv(name)
     if not value or len(value.strip()) < min_length:
-        raise RuntimeError(f"Missing or invalid environment variable: {name}")
-    return value
+        if required:
+            logger.error("Missing or invalid environment variable: %s", name)
+        return None
+    return value.strip()
 
-SUPABASE_URL = _require_env("SUPABASE_URL", 10)
-SUPABASE_SERVICE_ROLE_KEY = _require_env("SUPABASE_SERVICE_ROLE_KEY", 20)
-SUPABASE_JWT_SECRET = _require_env("SUPABASE_JWT_SECRET", 32)
+SUPABASE_URL = _get_env("SUPABASE_URL", 10)
+SUPABASE_SERVICE_ROLE_KEY = _get_env("SUPABASE_SERVICE_ROLE_KEY", 20)
+SUPABASE_JWT_SECRET = _get_env("SUPABASE_JWT_SECRET", 32)
 CHROMA_DIR = os.getenv("CHROMA_DIR", "./chroma_db")
 CHROMA_COLLECTION_NAME = os.getenv("CHROMA_COLLECTION_NAME", "nyayagpt")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:3b")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 
-# --- CLIENTS ---
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
-embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2", model_kwargs={"device": "cpu"})
+WARMUP_ON_STARTUP = os.getenv("WARMUP_ON_STARTUP", "true").lower() == "true"
+LLM_WAIT_ON_REQUEST = os.getenv("LLM_WAIT_ON_REQUEST", "false").lower() == "true"
 
-# Re-ranker (Cross Encoder) - Falls back gracefully if model download fails
-try:
-    reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2", device="cpu")
-except Exception:
-    reranker = None
-    print("Warning: CrossEncoder failed to load. Re-ranking disabled.")
+# --- CLIENTS (lazy init) ---
+supabase: Client | None = None
+embeddings = None
+vectorstore = None
+llm = None
+reranker = None
 
-vectorstore = Chroma(persist_directory=CHROMA_DIR, embedding_function=embeddings, collection_name=CHROMA_COLLECTION_NAME)
-llm = ChatOllama(model=OLLAMA_MODEL, temperature=0.1, base_url=OLLAMA_BASE_URL)
+_supabase_error: str | None = None
+_supabase_lock = asyncio.Lock()
+
+_llm_ready = False
+_llm_init_error: str | None = None
+_llm_init_task: asyncio.Task | None = None
+_llm_lock = asyncio.Lock()
 
 # Load IPC->BNS Map
 IPC_TO_BNS_MAP = {}
@@ -74,10 +90,6 @@ try:
     if map_path.exists():
         IPC_TO_BNS_MAP = json.loads(map_path.read_text(encoding="utf-8"))
 except Exception: pass
-
-# --- LOGGING ---
-logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper())
-logger = logging.getLogger("nyayagpt")
 
 # --- PROMPTS ---
 SYSTEM_PROMPT = (
@@ -123,18 +135,102 @@ class CreateChatRequest(BaseModel):
     title: Optional[constr(min_length=1, max_length=80)] = None
 
 # --- UTILS ---
-def verify_token(authorization: str = Header(...)) -> TokenData:
-    if not authorization.startswith("Bearer "): raise HTTPException(401, "Invalid Auth")
+def _init_llm_services_sync():
+    global embeddings, vectorstore, llm, reranker
+    embeddings = HuggingFaceEmbeddings(
+        model_name="sentence-transformers/all-MiniLM-L6-v2",
+        model_kwargs={"device": "cpu"}
+    )
+
+    vectorstore = Chroma(
+        persist_directory=CHROMA_DIR,
+        embedding_function=embeddings,
+        collection_name=CHROMA_COLLECTION_NAME
+    )
+
     try:
-        token = authorization.split(" ", 1)[1]
-        payload = jwt.decode(token, SUPABASE_JWT_SECRET, algorithms=["HS256"], options={"verify_aud": False})
-        return TokenData(sub=payload.get("sub"))
-    except:
+        reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2", device="cpu")
+    except Exception as e:
+        reranker = None
+        logger.warning("CrossEncoder failed to load. Re-ranking disabled. (%s)", str(e))
+
+    llm = ChatOllama(model=OLLAMA_MODEL, temperature=0.1, base_url=OLLAMA_BASE_URL)
+
+async def ensure_llm_services(wait: bool = False) -> bool:
+    global _llm_ready, _llm_init_error, _llm_init_task
+    if _llm_ready:
+        return True
+    if _llm_init_error:
+        return False
+
+    async with _llm_lock:
+        if _llm_ready:
+            return True
+        if _llm_init_error:
+            return False
+        if _llm_init_task is None:
+            async def _init_task():
+                global _llm_ready, _llm_init_error
+                try:
+                    await asyncio.to_thread(_init_llm_services_sync)
+                    _llm_ready = True
+                    logger.info("LLM services initialized")
+                except Exception as e:
+                    _llm_init_error = str(e)
+                    logger.error("LLM init failed: %s", _llm_init_error)
+
+            _llm_init_task = asyncio.create_task(_init_task())
+
+    if wait and _llm_init_task:
+        await _llm_init_task
+    return _llm_ready
+
+async def ensure_supabase():
+    global supabase, _supabase_error
+    if supabase or _supabase_error:
+        return
+    async with _supabase_lock:
+        if supabase or _supabase_error:
+            return
+        if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+            _supabase_error = "Supabase configuration missing"
+            logger.error(_supabase_error)
+            return
         try:
-            user = supabase.auth.get_user(token.split(" ", 1)[1] if " " in token else token).user
-            if user: return TokenData(sub=user.id)
-        except: pass
-        raise HTTPException(401, "Invalid Token")
+            supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+        except Exception as e:
+            _supabase_error = f"Supabase init failed: {e}"
+            logger.error(_supabase_error)
+
+async def get_supabase_client(raise_on_error: bool = True) -> Client | None:
+    await ensure_supabase()
+    if supabase:
+        return supabase
+    if raise_on_error:
+        raise HTTPException(503, "Database unavailable. Check server configuration.")
+    return None
+
+async def verify_token(authorization: str = Header(...)) -> TokenData:
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(401, "Invalid Auth")
+
+    token = authorization.split(" ", 1)[1]
+    if SUPABASE_JWT_SECRET:
+        try:
+            payload = jwt.decode(token, SUPABASE_JWT_SECRET, algorithms=["HS256"], options={"verify_aud": False})
+            return TokenData(sub=payload.get("sub"))
+        except JWTError:
+            pass
+
+    client = await get_supabase_client(raise_on_error=True)
+    try:
+        user = client.auth.get_user(token).user
+        if user:
+            return TokenData(sub=user.id)
+    except Exception:
+        pass
+
+    raise HTTPException(401, "Invalid Token")
 
 def _get_client_ip(request: Request) -> str | None:
     fwd = request.headers.get("x-forwarded-for")
@@ -153,7 +249,10 @@ def enforce_rate_limit(uid: str, ip: str):
 
 async def safe_save_messages(chat_id: str, user_msg: str, ai_msg: str):
     try:
-        await asyncio.to_thread(lambda: supabase.table("messages").insert([
+        client = await get_supabase_client(raise_on_error=False)
+        if not client:
+            return False
+        await asyncio.to_thread(lambda: client.table("messages").insert([
             {"chat_id": chat_id, "role": "user", "content": user_msg},
             {"chat_id": chat_id, "role": "assistant", "content": ai_msg}
         ]).execute())
@@ -161,7 +260,11 @@ async def safe_save_messages(chat_id: str, user_msg: str, ai_msg: str):
     except: return False
 
 async def log_audit_event(user_id: str, action: str, target_id: str = None):
-    try: await asyncio.to_thread(lambda: supabase.table("audit_logs").insert({"user_id": user_id, "action": action, "target_id": target_id}).execute())
+    try:
+        client = await get_supabase_client(raise_on_error=False)
+        if not client:
+            return
+        await asyncio.to_thread(lambda: client.table("audit_logs").insert({"user_id": user_id, "action": action, "target_id": target_id}).execute())
     except: pass
 
 def _extract_supabase_data(res: Any) -> Any:
@@ -203,69 +306,112 @@ async def security_middleware(request: Request, call_next):
     request.state.request_id = request.headers.get("X-Request-ID") or str(uuid4())
     if request.method in ("POST", "PUT", "PATCH"):
         body = await request.body()
-        if len(body) > 120_000: return JSONResponse({"error": "Payload too large"}, 413)
+        if len(body) > 120_000:
+            return JSONResponse({"error": "Payload too large", "request_id": request.state.request_id}, 413)
     response = await call_next(request)
     response.headers["X-Request-ID"] = request.state.request_id
     return response
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    return JSONResponse(
+        {"error": exc.detail, "request_id": getattr(request.state, "request_id", None)},
+        status_code=exc.status_code
+    )
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    logger.error("Unhandled error: %s", str(exc))
+    return JSONResponse(
+        {"error": "Internal server error", "request_id": getattr(request.state, "request_id", None)},
+        status_code=500
+    )
+
+@app.on_event("startup")
+async def warmup_services():
+    if WARMUP_ON_STARTUP:
+        await ensure_supabase()
+        await ensure_llm_services(wait=False)
+
+@app.get("/v1/health")
+async def health():
+    await ensure_supabase()
+    return {
+        "status": "ok",
+        "supabase_ready": bool(supabase),
+        "llm_ready": _llm_ready,
+        "llm_error": _llm_init_error,
+        "config_ok": bool(SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY and SUPABASE_JWT_SECRET)
+    }
 
 # --- ENDPOINTS ---
 
 @app.get("/v1/chats")
 async def list_chats(token: TokenData = Depends(verify_token), limit: int = 50):
-    res = await asyncio.to_thread(lambda: supabase.table("chats").select("id,title,created_at").eq("user_id", token.sub).is_("deleted_at", "null").order("created_at", desc=True).limit(limit).execute())
+    client = await get_supabase_client()
+    res = await asyncio.to_thread(lambda: client.table("chats").select("id,title,created_at").eq("user_id", token.sub).is_("deleted_at", "null").order("created_at", desc=True).limit(limit).execute())
     return {"chats": _extract_supabase_data(res) or []}
 
 @app.post("/v1/chats")
 async def create_chat(request: Request, payload: CreateChatRequest, token: TokenData = Depends(verify_token)):
     enforce_rate_limit(token.sub, _get_client_ip(request))
     title = (payload.title or "New chat")[:80]
+    client = await get_supabase_client()
     
     # Deduplication logic (Ghost Chat Prevention)
     cutoff = (datetime.now(timezone.utc) - timedelta(seconds=10)).isoformat()
-    recent = await asyncio.to_thread(lambda: supabase.table("chats").select("id,title,created_at").eq("user_id", token.sub).eq("title", "New chat").is_("deleted_at", "null").gte("created_at", cutoff).order("created_at", desc=True).limit(5).execute())
+    recent = await asyncio.to_thread(lambda: client.table("chats").select("id,title,created_at").eq("user_id", token.sub).eq("title", "New chat").is_("deleted_at", "null").gte("created_at", cutoff).order("created_at", desc=True).limit(5).execute())
     
     recent_chats = _extract_supabase_data(recent) or []
     for chat in recent_chats:
         # Check if empty
-        msgs = await asyncio.to_thread(lambda: supabase.table("messages").select("id").eq("chat_id", chat["id"]).limit(1).execute())
+        msgs = await asyncio.to_thread(lambda: client.table("messages").select("id").eq("chat_id", chat["id"]).limit(1).execute())
         if not _extract_supabase_data(msgs): return {"chat": chat}
 
     cid = str(uuid4())
-    res = await asyncio.to_thread(lambda: supabase.table("chats").insert({"id": cid, "user_id": token.sub, "title": title}).execute())
+    res = await asyncio.to_thread(lambda: client.table("chats").insert({"id": cid, "user_id": token.sub, "title": title}).execute())
     data = _extract_supabase_data(res)
     chat_obj = data[0] if isinstance(data, list) and data else {"id": cid, "title": title}
     await log_audit_event(token.sub, "chat.create", cid)
+    logger.info("chat.created user=%s chat_id=%s", token.sub, chat_obj.get("id"))
     return {"chat": chat_obj}
 
 @app.get("/v1/chats/{chat_id}/messages")
 async def get_messages(chat_id: str, token: TokenData = Depends(verify_token), limit: int = 50):
+    client = await get_supabase_client()
     # Ownership check
-    cres = await asyncio.to_thread(lambda: supabase.table("chats").select("user_id").eq("id", chat_id).single().execute())
+    cres = await asyncio.to_thread(lambda: client.table("chats").select("user_id").eq("id", chat_id).single().execute())
     cdata = _extract_supabase_data(cres)
     if not cdata or cdata["user_id"] != token.sub: raise HTTPException(404, ERROR_CHAT_NOT_FOUND)
     
-    res = await asyncio.to_thread(lambda: supabase.table("messages").select("*").eq("chat_id", chat_id).is_("deleted_at", "null").order("created_at", desc=True).limit(limit).execute())
+    res = await asyncio.to_thread(lambda: client.table("messages").select("*").eq("chat_id", chat_id).is_("deleted_at", "null").order("created_at", desc=True).limit(limit).execute())
     return {"messages": _extract_supabase_data(res) or []}
 
 @app.delete("/v1/chats/{chat_id}")
 async def delete_chat(chat_id: str, token: TokenData = Depends(verify_token)):
     enforce_rate_limit(token.sub, "unknown")
     t = datetime.now(timezone.utc).isoformat()
-    await asyncio.to_thread(lambda: supabase.table("chats").update({"deleted_at": t}).eq("id", chat_id).eq("user_id", token.sub).execute())
+    client = await get_supabase_client()
+    await asyncio.to_thread(lambda: client.table("chats").update({"deleted_at": t}).eq("id", chat_id).eq("user_id", token.sub).execute())
     return {"status": "deleted"}
 
 @app.post("/v1/chat")
 async def chat(payload: ChatRequest, request: Request, token: TokenData = Depends(verify_token)):
     enforce_rate_limit(token.sub, _get_client_ip(request))
+    client = await get_supabase_client()
     chat_id = payload.chat_id
     user_msg = payload.message.strip()
     mode = payload.mode
     jurisdiction = payload.jurisdiction
 
     # Verify Ownership
-    cres = await asyncio.to_thread(lambda: supabase.table("chats").select("user_id").eq("id", chat_id).single().execute())
+    cres = await asyncio.to_thread(lambda: client.table("chats").select("user_id").eq("id", chat_id).single().execute())
     cdata = _extract_supabase_data(cres)
     if not cdata or cdata["user_id"] != token.sub: raise HTTPException(403, ERROR_FORBIDDEN_CHAT)
+
+    llm_ready = await ensure_llm_services(wait=LLM_WAIT_ON_REQUEST)
+    if not llm_ready:
+        raise HTTPException(503, "AI service is warming up. Try again shortly.")
 
     # 1. TIMELINE MODE
     if mode == "timeline":
@@ -283,6 +429,7 @@ async def chat(payload: ChatRequest, request: Request, token: TokenData = Depend
                 end = {"type": "end", "saved": saved}
                 if not saved: end["warning"] = "HISTORY_SAVE_FAILED"
                 yield json.dumps(end) + "\n"
+                logger.info("chat.response user=%s chat_id=%s mode=timeline saved=%s", token.sub, chat_id, saved)
             except Exception:
                 yield json.dumps({"type": "error", "content": "Generation Failed"}) + "\n"
 
@@ -328,7 +475,7 @@ async def chat(payload: ChatRequest, request: Request, token: TokenData = Depend
         # C. History
         history = []
         try:
-            hres = await asyncio.to_thread(lambda: supabase.table("messages").select("role,content").eq("chat_id", chat_id).is_("deleted_at", "null").order("created_at", desc=True).limit(8).execute())
+            hres = await asyncio.to_thread(lambda: client.table("messages").select("role,content").eq("chat_id", chat_id).is_("deleted_at", "null").order("created_at", desc=True).limit(8).execute())
             for r in reversed(_extract_supabase_data(hres) or []):
                 history.append(HumanMessage(content=r["content"]) if r["role"] == "user" else AIMessage(content=r["content"]))
         except: pass
@@ -350,6 +497,7 @@ async def chat(payload: ChatRequest, request: Request, token: TokenData = Depend
             if not saved: end_pkt["warning"] = "HISTORY_SAVE_FAILED"
             yield json.dumps(end_pkt) + "\n"
             await log_audit_event(token.sub, "message.create", chat_id)
+            logger.info("chat.response user=%s chat_id=%s mode=%s saved=%s", token.sub, chat_id, mode, saved)
 
         except Exception as e:
             logger.error(f"LLM Error: {e}")
