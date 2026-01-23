@@ -13,6 +13,7 @@ export default function DashboardShell({
 }) {
   const [open, setOpen] = useState(false);
 
+  // Close sidebar on Escape key
   useEffect(() => {
     if (!open) return;
     const onKey = (e: KeyboardEvent) => {
@@ -22,50 +23,80 @@ export default function DashboardShell({
     return () => window.removeEventListener("keydown", onKey);
   }, [open]);
 
+  // Prevent body scroll when mobile menu is open
+  useEffect(() => {
+    if (open) {
+      document.body.style.overflow = "hidden";
+    } else {
+      document.body.style.overflow = "";
+    }
+    return () => { document.body.style.overflow = ""; };
+  }, [open]);
+
   return (
     <div className="flex h-screen w-full overflow-hidden bg-background text-white">
-      <div className="hidden w-64 md:flex">
+      {/* Desktop Sidebar (Hidden on Mobile) */}
+      <div className="hidden w-64 md:flex md:flex-col border-r border-border bg-surface/50">
         <SidebarWrapper initialChats={initialChats || []} />
       </div>
 
+      {/* Mobile Layout */}
       <div className="flex w-full flex-col md:hidden">
-        <div className="flex items-center justify-between border-b border-border bg-surface/70 px-4 py-3">
+        {/* Mobile Header */}
+        <div className="flex items-center justify-between border-b border-border bg-surface/80 backdrop-blur-md px-4 py-3 sticky top-0 z-30">
           <button
             onClick={() => setOpen(true)}
-            className="rounded-md border border-border px-3 py-2 text-sm"
+            className="rounded-md border border-border p-2 text-muted hover:text-white hover:bg-white/5 active:bg-white/10 transition-colors"
             aria-label="Open sidebar"
           >
-            <Menu className="h-4 w-4" />
+            <Menu className="h-5 w-5" />
           </button>
-          <span className="text-sm font-medium">NyayaGPT</span>
+          <span className="text-sm font-semibold tracking-wide">NyayaGPT</span>
+          <div className="w-9" /> {/* Spacer for centering */}
         </div>
 
+        {/* Mobile Sidebar Overlay */}
         {open && (
           <div className="fixed inset-0 z-50 flex">
-            <div className="w-72 bg-background">
-              <SidebarWrapper initialChats={initialChats || []} onNavigate={() => setOpen(false)} />
+            {/* Sidebar Content */}
+            <div className="w-72 bg-surface shadow-2xl animate-in slide-in-from-left duration-200">
+              <div className="flex items-center justify-between border-b border-border p-4">
+                <span className="font-semibold">Menu</span>
+                <button
+                  onClick={() => setOpen(false)}
+                  className="rounded-md p-1 text-muted hover:text-white hover:bg-white/5"
+                  aria-label="Close sidebar"
+                >
+                  <X className="h-5 w-5" />
+                </button>
+              </div>
+              <div className="h-[calc(100%-60px)]">
+                <SidebarWrapper 
+                  initialChats={initialChats || []} 
+                  onNavigate={() => setOpen(false)} 
+                />
+              </div>
             </div>
-            <button
+            
+            {/* Backdrop (Click to close) */}
+            <div 
               onClick={() => setOpen(false)}
-              className="flex-1 bg-black/50"
+              className="flex-1 bg-black/60 backdrop-blur-sm animate-in fade-in duration-200"
               aria-label="Close sidebar"
-            >
-              <span className="sr-only">Close</span>
-            </button>
-            <button
-              onClick={() => setOpen(false)}
-              className="absolute left-72 top-3 rounded-md border border-border bg-surface px-2 py-2"
-              aria-label="Close sidebar"
-            >
-              <X className="h-4 w-4" />
-            </button>
+            />
           </div>
         )}
 
-        <div className="flex-1 overflow-hidden">{children}</div>
+        {/* Main Content Area (Mobile) */}
+        <div className="flex-1 overflow-hidden relative">
+          {children}
+        </div>
       </div>
 
-      <div className="hidden flex-1 flex-col md:flex">{children}</div>
+      {/* Desktop Main Content Area */}
+      <div className="hidden flex-1 flex-col md:flex overflow-hidden relative">
+        {children}
+      </div>
     </div>
   );
 }

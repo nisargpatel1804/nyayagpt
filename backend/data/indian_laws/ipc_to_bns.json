@@ -1,0 +1,14 @@
+{
+  "302": { "bns": "103(1)", "description": "Punishment for murder" },
+  "420": { "bns": "318(4)", "description": "Cheating and dishonestly inducing delivery of property" },
+  "376": { "bns": "64", "description": "Punishment for rape" },
+  "375": { "bns": "63", "description": "Rape defined" },
+  "307": { "bns": "109", "description": "Attempt to murder" },
+  "323": { "bns": "115(2)", "description": "Punishment for voluntarily causing hurt" },
+  "324": { "bns": "118(1)", "description": "Voluntarily causing hurt by dangerous weapons or means" },
+  "354": { "bns": "74", "description": "Assault or criminal force to woman with intent to outrage her modesty" },
+  "506": { "bns": "351", "description": "Punishment for criminal intimidation" },
+  "124A": { "bns": "152", "description": "Sedition (now Treason/Acts endangering sovereignty)" },
+  "34": { "bns": "3(5)", "description": "Acts done by several persons in furtherance of common intention" },
+  "120B": { "bns": "61", "description": "Punishment of criminal conspiracy" }
+}

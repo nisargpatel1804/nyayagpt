@@ -1,303 +1,305 @@
 "use client";
 
-import { useEffect, useState, useCallback, useRef } from "react";
+import { useEffect, useState, useRef } from "react";
 import { useSearchParams, useRouter } from "next/navigation";
 import { supabaseClient } from "@/lib/supabaseClient";
+import { Clock, MessageSquare, ShieldAlert, MapPin } from "lucide-react";
 import ChatInput from "@/components/ChatInput";
 import ChatMessage from "@/components/ChatMessage";
-import ErrorBoundary from "@/components/ErrorBoundary";
 import EmptyState from "@/components/EmptyState";
+import ErrorBoundary from "@/components/ErrorBoundary";
+import TimelineTable from "@/components/TimelineTable";
 
-type Message = {
-  id?: string;
-  client_id?: string;
-  role: "user" | "assistant";
-  content: string;
-  created_at?: string;
-  isError?: boolean;
+type Message = { 
+  id: string; 
+  role: "user" | "assistant"; 
+  content: string; 
+  created_at?: string; 
+  isTimeline?: boolean; 
 };
 
 export default function DashboardPage() {
-  const searchParams = useSearchParams();
   const router = useRouter();
+  const searchParams = useSearchParams();
+  const chatIdParam = searchParams.get("id");
   const supabase = supabaseClient();
-  const apiUrl = process.env.NEXT_PUBLIC_API_URL;
-  const apiBase = apiUrl ? apiUrl.replace(/\/$/, "") + "/v1" : null;
-  
-  const chatId = searchParams.get("id");
+
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
-  const [isLoading, setIsLoading] = useState(false);
-  const [isCreatingChat, setIsCreatingChat] = useState(false);
-  const [hasMore, setHasMore] = useState(false);
-  const [oldestCursor, setOldestCursor] = useState<string | null>(null);
-  const oldestCursorRef = useRef<string | null>(null);
-  const [health, setHealth] = useState<"ok" | "degraded" | "error" | null>(null);
-  const [lastFailedMessage, setLastFailedMessage] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
+  
+  // MODES: Standard, Timeline, Devil's Advocate
+  const [mode, setMode] = useState<"standard" | "timeline" | "devils_advocate">("standard");
+  const [jurisdiction, setJurisdiction] = useState("All India");
 
-  const formatTimestamp = useCallback((value?: string) => {
-    if (!value) return "";
-    try {
-      return new Date(value).toLocaleString();
-    } catch {
-      return "";
-    }
-  }, []);
+  const bottomRef = useRef<HTMLDivElement>(null);
+  const streamingContentRef = useRef("");
+  const apiUrl = process.env.NEXT_PUBLIC_API_URL?.replace(/\/$/, "") + "/v1";
 
-  const generateChatTitle = useCallback((text: string) => {
-    const words = text.trim().split(/\s+/).slice(0, 6).join(" ");
-    return words.length > 0 ? words : "New chat";
-  }, []);
-
-  const fetchMessages = useCallback(async (loadMore = false) => {
-    if (!chatId) {
-      setMessages([]);
-      setHasMore(false);
-      setOldestCursor(null);
-      oldestCursorRef.current = null;
-      return;
-    }
-    if (!apiBase) return;
-    const { data: { session } } = await supabase.auth.getSession();
-    if (!session) return router.push("/login");
-    const cursor = oldestCursorRef.current;
-    const beforeParam = loadMore && cursor ? `&before=${encodeURIComponent(cursor)}` : "";
-    const res = await fetch(`${apiBase}/chats/${chatId}/messages?limit=50${beforeParam}`, {
-      headers: {
-        "Authorization": `Bearer ${session.access_token}`,
-      },
-    });
-    if (!res.ok) return;
-    const payload = await res.json();
-    const incoming = (payload?.messages || []) as Message[];
-    if (loadMore) {
-      setMessages((prev) => [...incoming, ...prev]);
-    } else {
-      setMessages(incoming);
-    }
-    if (incoming.length > 0) {
-      const nextCursor = incoming[0]?.created_at || cursor;
-      setOldestCursor(nextCursor);
-      oldestCursorRef.current = nextCursor;
-    }
-    setHasMore(incoming.length === 50);
-  }, [chatId, apiBase, supabase, router]);
-
+  // --- Load Chat History ---
   useEffect(() => {
-    fetchMessages();
-  }, [fetchMessages]);
-
-  useEffect(() => {
-    if (!apiBase) return;
-    let cancelled = false;
-    const checkHealth = async () => {
+    if (!chatIdParam) { 
+      setMessages([]); 
+      return; 
+    }
+    
+    const fetchMsgs = async () => {
+      const { data } = await supabase.auth.getSession();
+      if (!data.session || !apiUrl) return;
+      
       try {
-        const res = await fetch(`${apiBase}/health`);
-        if (!res.ok) throw new Error("Health check failed");
-        const payload = await res.json();
-        if (!cancelled) setHealth(payload?.status || "ok");
-      } catch {
-        if (!cancelled) setHealth("error");
+        const res = await fetch(`${apiUrl}/chats/${chatIdParam}/messages?limit=50`, {
+          headers: { Authorization: `Bearer ${data.session.access_token}` },
+        });
+        
+        if (res.ok) {
+          const payload = await res.json();
+          // Detect if historical messages are timelines based on content heuristic
+          const msgs = (payload.messages || []).reverse().map((m: any) => ({
+            ...m,
+            isTimeline: m.content.trim().startsWith("[") && m.content.includes('"Date"')
+          }));
+          setMessages(msgs);
+          setTimeout(() => bottomRef.current?.scrollIntoView(), 100);
+        } else if (res.status === 404) {
+          router.replace("/dashboard");
+        }
+      } catch (e) { 
+        console.error("Failed to fetch messages:", e); 
       }
     };
-    checkHealth();
-    return () => {
-      cancelled = true;
-    };
-  }, [apiBase]);
-
-  useEffect(() => {
-    const { data: listener } = supabase.auth.onAuthStateChange((_event, session) => {
-      if (!session) router.push("/login");
-    });
-    return () => {
-      listener?.subscription?.unsubscribe();
-    };
-  }, [supabase, router]);
-
-  useEffect(() => {
-    const onKeyDown = (event: KeyboardEvent) => {
-      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") {
-        event.preventDefault();
-        router.push("/dashboard");
-      }
-    };
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, [router]);
-
-  const handleSend = async (overrideMessage?: string) => {
-    const messageToSend = overrideMessage ?? input.trim();
-    if (!messageToSend || isLoading || isCreatingChat) return;
     
-    if (health === "degraded" || health === "error") {
-      setToast("Cannot send message: backend services are unavailable");
-      return;
-    }
+    fetchMsgs();
+  }, [chatIdParam, apiUrl, router, supabase.auth]);
+
+  // --- Handle Send Logic ---
+  const handleSend = async () => {
+    if (!input.trim() || loading || !apiUrl) return;
     
-    const userMessage = messageToSend.trim();
+    const userContent = input.trim();
+    const currentMode = mode;
+    const currentJurisdiction = jurisdiction;
+    
     setInput("");
-    setIsLoading(true);
-    setLastFailedMessage(null);
+    setLoading(true);
+    streamingContentRef.current = "";
+
+    // 1. Optimistic Updates
+    const tempId = Date.now().toString();
+    setMessages(p => [...p, { id: tempId, role: "user", content: userContent }]);
+    
+    const aiMsgId = tempId + "_ai";
+    setMessages(p => [...p, { 
+      id: aiMsgId, 
+      role: "assistant", 
+      content: "", 
+      isTimeline: currentMode === "timeline" 
+    }]);
+    
+    setTimeout(() => bottomRef.current?.scrollIntoView({ behavior: "smooth" }), 50);
 
     try {
-      const clientId = `temp-${Date.now()}`;
-      setMessages((prev) => [...prev, { role: "user", content: userMessage, client_id: clientId, created_at: new Date().toISOString() }]);
+      const { data } = await supabase.auth.getSession();
+      if (!data.session) throw new Error("Unauthorized");
+      const token = data.session.access_token;
 
-      const { data: { user } } = await supabase.auth.getUser();
-      const { data: { session } } = await supabase.auth.getSession();
-      if (!user || !session) return router.push("/login");
-
-      let currentChatId = chatId;
+      // 2. Create Chat if Needed (Ghost Chat Prevention)
+      let currentChatId = chatIdParam;
       if (!currentChatId) {
-        setIsCreatingChat(true);
-        if (!apiBase) throw new Error("Missing API URL");
-        const createRes = await fetch(`${apiBase}/chats`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Authorization": `Bearer ${session.access_token}`,
-          },
-          body: JSON.stringify({ title: "New chat" }),
+        const cRes = await fetch(`${apiUrl}/chats`, {
+          method: "POST", 
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+          body: JSON.stringify({ title: userContent.slice(0, 30) }),
         });
-        if (!createRes.ok) throw new Error("Failed to create chat");
-        const payload = await createRes.json();
-        currentChatId = payload?.chat?.id;
-        if (!currentChatId) throw new Error("Invalid chat response");
-
-        router.push(`/dashboard?id=${currentChatId}`);
-        router.refresh();
-        setIsCreatingChat(false);
+        
+        if (!cRes.ok) throw new Error("Failed to create chat");
+        
+        const cData = await cRes.json();
+        currentChatId = cData.chat.id;
+        
+        // Sync URL without reload
+        window.history.replaceState(null, "", `/dashboard?id=${currentChatId}`);
+        // Notify Sidebar
+        window.dispatchEvent(new Event("nyayagpt:refresh-chats"));
       }
 
-      const response = await fetch(`${apiBase}/chat`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Authorization": `Bearer ${session.access_token}`,
-        },
-        body: JSON.stringify({
-          message: userMessage,
-          chat_id: currentChatId,
+      // 3. Start Streaming Request
+      const res = await fetch(`${apiUrl}/chat`, {
+        method: "POST", 
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ 
+          chat_id: currentChatId, 
+          message: userContent, 
+          mode: currentMode,
+          jurisdiction: currentJurisdiction
         }),
       });
 
-      if (!response.ok) throw new Error("Failed to fetch response");
-      const payload = await response.json();
-      setMessages((prev) => [...prev, { role: "assistant", content: payload?.response || "", created_at: new Date().toISOString() }]);
-      if (currentChatId && apiBase) {
-        const newTitle = generateChatTitle(userMessage);
-        await fetch(`${apiBase}/chats/${currentChatId}`, {
-          method: "PATCH",
-          headers: {
-            "Content-Type": "application/json",
-            "Authorization": `Bearer ${session.access_token}`,
-          },
-          body: JSON.stringify({ title: newTitle, only_if_default: true })
-        });
-        window.dispatchEvent(new Event("nyayagpt:refresh-chats"));
+      if (!res.ok || !res.body) throw new Error("Stream failed");
+      
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      // 4. Stream Loop
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
+
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          try {
+            const json = JSON.parse(line);
+            
+            if (json.type === "token") {
+              streamingContentRef.current += json.content;
+              
+              setMessages(p => p.map(m => 
+                m.id === aiMsgId ? { ...m, content: streamingContentRef.current } : m
+              ));
+              
+              // Only auto-scroll if user hasn't scrolled up significantly
+              bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+            } 
+            else if (json.type === "end" && json.warning) {
+              setToast("⚠️ Response generated, but history save failed.");
+            }
+            else if (json.type === "error") {
+              setToast(`Error: ${json.content}`);
+            }
+          } catch (e) {
+            // Ignore parse errors for partial chunks
+          }
+        }
       }
-      await fetchMessages();
-      if (!chatId) router.refresh();
-    } catch (error) {
-      console.error(error);
-      setMessages((prev) => [...prev, { role: "assistant", content: "Error: Unable to connect to the legal AI.", isError: true, created_at: new Date().toISOString() }]);
-      setLastFailedMessage(userMessage);
-    } finally {
-      setIsLoading(false);
-      setIsCreatingChat(false);
+    } catch (e: any) {
+      setToast(`Error: ${e.message}`);
+      // If failed before any token received, remove the placeholder
+      if (!streamingContentRef.current) {
+        setMessages(p => p.filter(m => m.id !== aiMsgId));
+        setInput(userContent);
+      }
+    } finally { 
+      setLoading(false); 
     }
   };
 
-  const handleRetry = async () => {
-    if (!lastFailedMessage) return;
-    const retryMessage = lastFailedMessage;
-    setLastFailedMessage(null);
-    await handleSend(retryMessage);
-  };
-
-  const handleCopy = async (content: string) => {
-    try {
-      await navigator.clipboard.writeText(content);
-      setToast("Copied to clipboard");
-    } catch {
-      setToast("Copy failed");
+  // Toast Timer
+  useEffect(() => { 
+    if (toast) {
+      const t = setTimeout(() => setToast(null), 3000); 
+      return () => clearTimeout(t);
     }
-  };
-
-  useEffect(() => {
-    if (!toast) return;
-    const timer = setTimeout(() => setToast(null), 2000);
-    return () => clearTimeout(timer);
   }, [toast]);
+
+  // --- Helper for Mode Buttons ---
+  const ModeButton = ({ id, icon: Icon, label, activeColor }: any) => (
+    <button
+      onClick={() => setMode(id)}
+      className={`flex items-center gap-2 rounded-md px-3 py-1.5 text-xs font-medium transition border ${
+        mode === id 
+          ? `${activeColor} border-transparent text-white shadow-sm` 
+          : "bg-surface border-border text-muted hover:bg-white/5"
+      }`}
+    >
+      <Icon className="h-3.5 w-3.5" /> {label}
+    </button>
+  );
 
   return (
     <ErrorBoundary>
-      <div className="flex h-full flex-col">
-        <div className="flex-1 overflow-y-auto px-4 py-6 scrollbar-hide md:px-10">
-          {!apiBase && (
-            <div className="mb-4 rounded-lg border border-border bg-red-500/10 px-4 py-2 text-sm text-red-300">
-              Missing API configuration. Set NEXT_PUBLIC_API_URL in frontend/.env.
-            </div>
-          )}
-          {health && health !== "ok" && (
-            <div className="mb-4 rounded-lg border border-red-500/50 bg-red-500/10 px-4 py-2 text-sm text-red-300">
-              ⚠️ Backend services are unavailable. Chat is disabled until services are restored.
-            </div>
-          )}
-          {toast && (
-            <div className="mb-4 rounded-lg border border-border bg-emerald-500/10 px-4 py-2 text-sm text-emerald-300">
-              {toast}
-            </div>
-          )}
-          {lastFailedMessage && (
-            <div className="mb-4 flex items-center justify-between rounded-lg border border-border bg-red-500/10 px-4 py-2 text-sm text-red-300">
-              <span>Last message failed. You can retry.</span>
-              <button
-                onClick={handleRetry}
-                className="rounded-md border border-border px-3 py-1 text-xs text-white"
-              >
-                Retry
-              </button>
-            </div>
-          )}
-          {hasMore && (
-            <div className="mb-4 flex justify-center">
-              <button
-                onClick={() => fetchMessages(true)}
-                className="rounded-md border border-border px-4 py-2 text-xs text-muted hover:text-white"
-              >
-                Load more
-              </button>
-            </div>
-          )}
-          <div className="mx-auto max-w-3xl space-y-6">
-            {messages.length === 0 && !isLoading && !isCreatingChat && <EmptyState />}
-            {messages.map((msg, idx) => (
-              <ChatMessage
-                key={msg.id || msg.client_id || idx}
-                role={msg.role}
-                content={msg.content}
-                createdAt={formatTimestamp(msg.created_at)}
-                isError={msg.isError}
-                onCopy={() => handleCopy(msg.content)}
-              />
-            ))}
+      <div className="relative flex h-full flex-col bg-[#0b0f14]">
+        {/* Toast Notification */}
+        {toast && (
+          <div className="absolute left-1/2 top-4 z-50 -translate-x-1/2 rounded-lg bg-surface border border-border px-4 py-3 text-sm shadow-xl text-amber-400 animate-in fade-in slide-in-from-top-2">
+            {toast}
           </div>
+        )}
+        
+        {/* Chat Area */}
+        <div className="flex-1 overflow-y-auto p-4 scrollbar-hide md:p-6">
+          {!chatIdParam && messages.length === 0 ? (
+            <div className="mt-10 md:mt-20">
+              <EmptyState />
+            </div>
+          ) : (
+            <div className="mx-auto flex max-w-3xl flex-col gap-6">
+              {messages.map(msg => (
+                <div key={msg.id}>
+                  {/* If Timeline Mode, render Table. Else render ChatMessage */}
+                  {msg.isTimeline && msg.role === "assistant" ? (
+                    <TimelineTable content={msg.content} />
+                  ) : (
+                    <ChatMessage 
+                      role={msg.role} 
+                      content={msg.content} 
+                      createdAt={msg.created_at} 
+                      onCopy={() => navigator.clipboard.writeText(msg.content)}
+                    />
+                  )}
+                </div>
+              ))}
+              
+              {/* Typing Indicator */}
+              {loading && !streamingContentRef.current && (
+                 <div className="flex items-center gap-2 rounded-2xl bg-white/5 px-4 py-3 text-sm text-muted w-fit animate-pulse">
+                   <span>Thinking...</span>
+                 </div>
+              )}
+              <div ref={bottomRef} />
+            </div>
+          )}
         </div>
 
-        <div className="border-t border-border bg-[#0b0f14] p-4 pb-6 md:px-10">
-          <div className="mx-auto max-w-3xl">
-            <ChatInput
-              value={input}
-              onChange={setInput}
-              onSend={handleSend}
-              disabled={isLoading || isCreatingChat || health === "degraded" || health === "error"}
-              isLoading={isLoading}
+        {/* Footer: Controls & Input */}
+        <div className="border-t border-border bg-[#0b0f14]/80 backdrop-blur-md p-4 md:p-6 pb-8">
+          <div className="mx-auto max-w-3xl space-y-4">
+            
+            {/* Control Bar */}
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              {/* Modes */}
+              <div className="flex flex-wrap gap-2">
+                <ModeButton id="standard" icon={MessageSquare} label="Standard" activeColor="bg-primary" />
+                <ModeButton id="timeline" icon={Clock} label="Timeline" activeColor="bg-emerald-600" />
+                <ModeButton id="devils_advocate" icon={ShieldAlert} label="Devil's Advocate" activeColor="bg-red-600" />
+              </div>
+              
+              {/* Jurisdiction Dropdown */}
+              <div className="flex items-center gap-2 rounded-md border border-border bg-surface px-2 py-1.5 w-fit">
+                <MapPin className="h-3 w-3 text-muted" />
+                <select 
+                  value={jurisdiction} 
+                  onChange={(e) => setJurisdiction(e.target.value)}
+                  className="bg-transparent text-xs text-white outline-none cursor-pointer"
+                >
+                  <option value="All India">All India</option>
+                  <option value="Maharashtra">Maharashtra</option>
+                  <option value="Uttar Pradesh">Uttar Pradesh</option>
+                  <option value="Karnataka">Karnataka</option>
+                  <option value="Delhi">Delhi</option>
+                </select>
+              </div>
+            </div>
+
+            {/* Input Component */}
+            <ChatInput 
+              value={input} 
+              onChange={setInput} 
+              onSend={handleSend} 
+              disabled={loading} 
+              isLoading={loading} 
             />
-            <p className="mt-2 text-center text-xs text-muted">
-              NyayaGPT can make mistakes. Please verify important legal information.
+            
+            {/* Helper Text */}
+            <p className="text-center text-[10px] text-muted transition-all">
+              {mode === "devils_advocate" ? "⚠️ Mode Active: The AI will aggressively counter your arguments." : 
+               mode === "timeline" ? "Paste case details to generate a chronology." :
+               "NyayaGPT can make mistakes. Verify important legal information."}
             </p>
           </div>
         </div>

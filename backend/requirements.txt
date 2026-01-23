@@ -6,8 +6,10 @@ supabase==2.5.1
 langchain-community==0.2.11
 langchain-chroma==0.1.4
 langchain-huggingface==0.0.3
+langchain-core==0.2.23
 langchain-text-splitters==0.2.4
 chromadb==0.5.23
 sentence-transformers==3.0.1
 pypdf==4.2.0
 posthog==3.5.0
+pydantic==2.8.2

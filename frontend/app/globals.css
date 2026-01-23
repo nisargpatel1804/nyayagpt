@@ -24,22 +24,54 @@ body {
   @apply bg-background text-white;
 }
 
+/* Markdown Content Styling */
+.prose-markdown {
+  @apply text-sm leading-relaxed;
+}
+
+.prose-markdown p {
+  @apply mb-4 last:mb-0;
+}
+
+.prose-markdown h1,
+.prose-markdown h2,
+.prose-markdown h3 {
+  @apply font-semibold mt-6 mb-3 text-white;
+}
+
+.prose-markdown h1 { @apply text-xl; }
+.prose-markdown h2 { @apply text-lg; }
+.prose-markdown h3 { @apply text-base; }
+
+.prose-markdown ul, 
+.prose-markdown ol {
+  @apply ml-4 mb-4 list-outside space-y-1;
+}
+
+.prose-markdown ul { @apply list-disc; }
+.prose-markdown ol { @apply list-decimal; }
+
 .prose-markdown pre {
-  @apply rounded-lg bg-[#0f1621] p-3 overflow-x-auto;
+  @apply rounded-lg bg-[#0f1621] p-3 overflow-x-auto border border-white/10 my-4;
 }
 
 .prose-markdown code {
-  @apply rounded bg-white/10 px-1 py-0.5 text-xs;
+  @apply rounded bg-white/10 px-1.5 py-0.5 text-xs font-mono text-primary-foreground;
 }
 
 .prose-markdown pre code {
-  @apply bg-transparent p-0 text-sm;
+  @apply bg-transparent p-0 text-sm text-gray-300;
 }
 
 .prose-markdown a {
-  @apply text-primary underline;
+  @apply text-primary underline underline-offset-4 hover:text-primary/80 transition-colors;
 }
 
+.prose-markdown blockquote {
+  @apply border-l-4 border-primary/50 pl-4 py-1 my-4 text-muted italic bg-white/5 rounded-r-lg;
+}
+
+/* Scrollbar Utilities */
 .scrollbar-hide::-webkit-scrollbar {
   display: none;
 }
@@ -47,4 +79,18 @@ body {
 .scrollbar-hide {
   -ms-overflow-style: none;
   scrollbar-width: none;
+}
+
+/* Custom Scrollbar for non-hidden areas */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  @apply bg-transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  @apply bg-white/10 rounded-full hover:bg-white/20 transition-colors;
 }
